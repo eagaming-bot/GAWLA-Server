@@ -106,6 +106,11 @@ function publicRoomState(room, roomCode) {
     settings: room.settings,
     scores: room.scores,
     turnOrder: room.turnOrder,
+    // اسم الفريق اللي انسحب - بيتعرض في شاشة الانتظار بعد الانسحاب مباشرة
+    lastWithdrawTeamName:
+      room.phase === "explainWithdrawn" && room.round?.pendingWithdrawTeamId
+        ? room.teams[room.round.pendingWithdrawTeamId]?.name || "؟"
+        : null,
     serverNow: Date.now(),
     teams: Object.fromEntries(
       Object.entries(room.teams).map(([teamId, t]) => [
@@ -1168,13 +1173,17 @@ function onWithdraw(roomCode, requesterId) {
   if (requesterId !== room.round.explain.playerId) return; // بس اللاعب اللي بيشرح دلوقتي يقدر ينسحب
   clearTimeout(room.round.explain.timeout);
   const teamId = room.round.explain.teamId;
-  // مفيش خصم نقاط - الفريق بيفضل ثابت في نقطته، بس بيخسر دوره وينتقل للفريق اللي بعده
+  // مفيش خصم نقاط - الفريق بيفضل ثابت في نقطته، بس بيخسر دوره وينتقل للفريق اللي بعده.
+  // بنوقف هنا وننتظر الهوست يدوس "التالي" عشان تايمر الفريق اللي بعده مايبدأش
+  // فورًا من غير ما الكل ياخد لحظة يستوعب إن اللي فات انسحب.
+  room.phase = "explainWithdrawn";
+  room.round.pendingWithdrawTeamId = teamId;
   io.to(roomCode).emit("explain:withdrawn", {
     teamId,
     teamName: room.teams[teamId] ? room.teams[teamId].name : "؟",
     scores: room.scores,
   });
-  advanceToNextBidder(roomCode);
+  broadcastRoom(roomCode);
 }
 
 // لو اللاعب اللي بيشرح دلوقتي خرج/فصل النت أثناء دوره، ننتقل تلقائيًا للفريق اللي بعده من غير خصم نقطة
@@ -2002,6 +2011,15 @@ io.on("connection", (socket) => {
     const roomCode = socket.data.roomCode;
     if (!roomCode) return;
     onWithdraw(roomCode, socket.id);
+  });
+
+  // الهوست بيدوس "التالي" بعد الانسحاب عشان يبدأ دور الفريق اللي بعده -
+  // بدل ما التايمر يبدأ لوحده على طول لحظة الانسحاب
+  socket.on("host:continueAfterWithdraw", () => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || socket.id !== room.hostSocketId || room.phase !== "explainWithdrawn") return;
+    advanceToNextBidder(roomCode);
   });
 
   socket.on("continue:vote", ({ vote }) => {
