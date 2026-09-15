@@ -90,6 +90,7 @@ function newRoom(hostSocketId) {
     moviesSettings: { actDuration: 60, targetScore: 5 }, // مدة التمثيل بالثواني + عدد الأفلام للفوز
     system: null, // حالة لعبة سيستم
     guess: null, // حالة لعبة خمن
+    mafia: null, // حالة لعبة مافيا
     started: false,
   };
 }
@@ -238,6 +239,39 @@ function publicRoomState(room, roomCode) {
           guessText: room.guess.phase === "reveal" ? room.guess.guessText : null,
           correct: room.guess.phase === "reveal" ? room.guess.correct : null,
           word: room.guess.phase === "reveal" ? room.guess.word : null,
+        }
+      : null,
+    mafia: room.mafia
+      ? {
+          phase: room.mafia.phase, // night | reveal_wills | day_announce | discussion | voting | vote_result | gameover
+          round: room.mafia.round,
+          paused: !!room.mafia.paused,
+          pausedRemainingSeconds: room.mafia.paused && room.mafia.pausedRemainingMs != null ? Math.ceil(room.mafia.pausedRemainingMs / 1000) : null,
+          playerOrder: room.mafia.playerOrder,
+          aliveIds: room.mafia.aliveIds,
+          mafiaCount: room.mafia.mafiaCount,
+          doctorCount: room.mafia.doctorCount,
+          // بيتكشف بس لما اللاعب يموت (ليلاً أو بالتصويت) - آمن يتبعت للكل طول الوقت
+          revealedRoles: room.mafia.revealedRoles,
+          // مؤشرات تقدم بس من غير ما تكشف مين اختار مين
+          mafiaTargetLocked: !!room.mafia.nightTargetId,
+          doctorTargetLocked: !!room.mafia.healTargetId,
+          willsSubmittedCount: Object.keys(room.mafia.wills).length,
+          discussionEndsAt: room.mafia.discussionEndsAt,
+          // الوصايا بتتكشف من غير أسامي بس فى مرحلة reveal_wills وبعدها
+          wills:
+            room.mafia.phase === "reveal_wills" ||
+            room.mafia.phase === "day_announce" ||
+            room.mafia.phase === "discussion" ||
+            room.mafia.phase === "voting"
+              ? room.mafia.willsRevealList
+              : null,
+          lastResult: room.mafia.phase === "day_announce" ? room.mafia.lastNightResult : null,
+          voteCounts: room.mafia.phase === "vote_result" ? room.mafia.voteCounts : null,
+          lastVoteOut: room.mafia.phase === "vote_result" ? room.mafia.lastVoteOut : null,
+          winner: room.mafia.winner,
+          // اللعبة خلصت - مفيش أي داعي للسرية بقى، نكشف كل الأدوار
+          allRoles: room.mafia.phase === "gameover" ? room.mafia.roles : null,
         }
       : null,
   };
@@ -401,6 +435,13 @@ function endSniperMatchIfActive(room, roomCode) {
   }
   if (room.selectedGame === "guess" && room.guess && room.guess.phase !== "reveal") {
     room.guess = null;
+    room.started = false;
+    room.phase = "lobby";
+    io.to(roomCode).emit("game:error", "الماتش اتقفل لأن حد من اللاعبين خرج.");
+  }
+  if (room.selectedGame === "mafia" && room.mafia && room.mafia.phase !== "gameover") {
+    if (room.mafia.discussionTimeout) clearTimeout(room.mafia.discussionTimeout);
+    room.mafia = null;
     room.started = false;
     room.phase = "lobby";
     io.to(roomCode).emit("game:error", "الماتش اتقفل لأن حد من اللاعبين خرج.");
@@ -635,6 +676,209 @@ function startSystemMatch(roomCode, customText) {
 }
 
 // ---------- لعبة خمن ----------
+// ---------- لعبة مافيا ----------
+
+// جدول احتمالات عدد المافيا حسب عدد اللاعبين - أقصى حد 4 مهما زاد العدد
+function pickMafiaCountRandom(n) {
+  let weights; // [{c, w}]
+  if (n <= 4) weights = [{ c: 1, w: 100 }];
+  else if (n === 5) weights = [{ c: 1, w: 80 }, { c: 2, w: 20 }];
+  else if (n === 6) weights = [{ c: 1, w: 60 }, { c: 2, w: 40 }];
+  else if (n === 7) weights = [{ c: 1, w: 40 }, { c: 2, w: 40 }, { c: 3, w: 20 }];
+  else if (n === 8) weights = [{ c: 1, w: 25 }, { c: 2, w: 40 }, { c: 3, w: 35 }];
+  else if (n === 9) weights = [{ c: 2, w: 40 }, { c: 3, w: 60 }];
+  else {
+    // 10 لاعبين فيما فوق: فرصة الـ4 بتزيد تدريجيًا كل ما العدد زاد، وسقفها ميعديش 4
+    const extra = Math.min(n - 10, 6); // بنوقف الزيادة عند 16 لاعب عشان الفرص متفضلش تكبر للأبد
+    const w4 = 25 + extra * 4; // من 25% عند 10 لاعبين لحد ~49% عند 16+
+    const w3 = 40;
+    const w2 = Math.max(10, 100 - w4 - w3);
+    weights = [{ c: 2, w: w2 }, { c: 3, w: w3 }, { c: 4, w: w4 }];
+  }
+  const total = weights.reduce((s, x) => s + x.w, 0);
+  let r = Math.random() * total;
+  for (const { c, w } of weights) {
+    if (r < w) return c;
+    r -= w;
+  }
+  return weights[weights.length - 1].c;
+}
+
+function maxMafiaFor(n) {
+  if (n <= 4) return 1;
+  if (n <= 6) return 2;
+  if (n <= 9) return 3;
+  return 4;
+}
+
+// عدد الأطباء بيتحدد من اللعبة نفسها بالكامل - مفيش تدخل من الهوست خالص
+function pickDoctorCount(n, mafiaCount) {
+  if (n >= 8 && (mafiaCount === 2 || mafiaCount === 3)) {
+    return Math.random() < 0.35 ? 2 : 1;
+  }
+  return 1;
+}
+
+function shuffleArray(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function startMafiaMatch(roomCode, mafiaCountChoice) {
+  const room = rooms[roomCode];
+  if (!room) return;
+  const playerIds = Object.keys(room.players);
+  const n = playerIds.length;
+  if (n < 4) {
+    io.to(roomCode).emit("game:error", "لازم 4 لاعبين على الأقل عشان تبدأ مافيا.");
+    return;
+  }
+  const max = maxMafiaFor(n);
+  let mafiaCount;
+  if (mafiaCountChoice === "random" || !mafiaCountChoice) {
+    mafiaCount = pickMafiaCountRandom(n);
+  } else {
+    mafiaCount = Math.max(1, Math.min(max, Number(mafiaCountChoice) || 1));
+  }
+  const doctorCount = pickDoctorCount(n, mafiaCount);
+
+  const shuffled = shuffleArray(playerIds);
+  const roles = {};
+  shuffled.slice(0, mafiaCount).forEach((id) => (roles[id] = "mafia"));
+  shuffled.slice(mafiaCount, mafiaCount + doctorCount).forEach((id) => (roles[id] = "doctor"));
+  shuffled.slice(mafiaCount + doctorCount).forEach((id) => (roles[id] = "citizen"));
+
+  room.mafia = {
+    playerOrder: playerIds.slice(),
+    aliveIds: playerIds.slice(),
+    roles,
+    mafiaCount,
+    doctorCount,
+    round: 1,
+    phase: "night",
+    paused: false,
+    nightTargetId: null,
+    healTargetId: null,
+    doctorSelfHealCounts: {},
+    doctorLastSelfHealRound: {},
+    wills: {},
+    willsRevealList: [],
+    lastNightResult: null,
+    revealedRoles: {},
+    discussionEndsAt: null,
+    discussionTimeout: null,
+    votes: {},
+    voteCounts: null,
+    lastVoteOut: null,
+    winner: null,
+  };
+  room.started = true;
+  room.phase = "mafiaPlaying";
+  broadcastRoom(roomCode);
+  const mafiaIds = playerIds.filter((id) => roles[id] === "mafia");
+  for (const pid of playerIds) {
+    // المافيا بيعرفوا بعض؛ الدكتور والمواطن ماعندهمش معلومة زيادة عن دورهم
+    io.to(pid).emit("mafia:role", { role: roles[pid], teammates: roles[pid] === "mafia" ? mafiaIds.filter((id) => id !== pid) : [] });
+  }
+}
+
+function aliveMafiaCount(m) {
+  return m.aliveIds.filter((id) => m.roles[id] === "mafia").length;
+}
+function aliveNonMafiaCount(m) {
+  return m.aliveIds.filter((id) => m.roles[id] !== "mafia").length;
+}
+
+function checkMafiaWin(room) {
+  const m = room.mafia;
+  if (aliveMafiaCount(m) === 0) {
+    m.winner = "citizens";
+    m.phase = "gameover";
+    return true;
+  }
+  if (aliveNonMafiaCount(m) === 0) {
+    m.winner = "mafia";
+    m.phase = "gameover";
+    return true;
+  }
+  return false;
+}
+
+function tryAdvanceMafiaNight(roomCode) {
+  const room = rooms[roomCode];
+  if (!room || !room.mafia || room.mafia.phase !== "night") return;
+  const m = room.mafia;
+  const mafiaAlive = aliveMafiaCount(m) > 0;
+  const doctorAliveIds = m.aliveIds.filter((id) => m.roles[id] === "doctor");
+  const needMafiaTarget = mafiaAlive ? !!m.nightTargetId : true;
+  const needDoctorTarget = doctorAliveIds.length > 0 ? !!m.healTargetId : true;
+  const allWillsIn = m.aliveIds.every((id) => m.wills[id] !== undefined);
+  if (needMafiaTarget && needDoctorTarget && allWillsIn) {
+    advanceToRevealWills(roomCode);
+  }
+}
+
+function advanceToRevealWills(roomCode) {
+  const room = rooms[roomCode];
+  const m = room.mafia;
+  m.willsRevealList = shuffleArray(Object.values(m.wills).map((text) => ({ text })));
+  m.phase = "reveal_wills";
+
+  const saved = !!m.nightTargetId && m.healTargetId === m.nightTargetId;
+  let killedId = null;
+  if (m.nightTargetId && !saved) {
+    killedId = m.nightTargetId;
+    m.aliveIds = m.aliveIds.filter((id) => id !== killedId);
+    m.revealedRoles[killedId] = m.roles[killedId];
+  }
+  m.lastNightResult = {
+    killedId,
+    killedName: killedId ? room.players[killedId]?.name || "؟" : null,
+    saved: !!m.nightTargetId && saved,
+  };
+  broadcastRoom(roomCode);
+}
+
+function startMafiaVoting(roomCode) {
+  const room = rooms[roomCode];
+  if (!room || !room.mafia) return;
+  room.mafia.phase = "voting";
+  room.mafia.discussionTimeout = null;
+  broadcastRoom(roomCode);
+}
+
+function resolveMafiaVote(roomCode) {
+  const room = rooms[roomCode];
+  const m = room.mafia;
+  const counts = {};
+  for (const targetId of Object.values(m.votes)) {
+    counts[targetId] = (counts[targetId] || 0) + 1;
+  }
+  let topId = null;
+  let topCount = -1;
+  for (const [pid, count] of Object.entries(counts)) {
+    if (count > topCount) {
+      topCount = count;
+      topId = pid;
+    }
+  }
+  m.voteCounts = counts;
+  m.aliveIds = m.aliveIds.filter((id) => id !== topId);
+  m.revealedRoles[topId] = m.roles[topId];
+  m.lastVoteOut = {
+    id: topId,
+    name: room.players[topId]?.name || "؟",
+    role: m.roles[topId],
+  };
+  m.phase = "vote_result";
+  checkMafiaWin(room);
+  broadcastRoom(roomCode);
+}
+
 function startGuessMatch(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
@@ -667,7 +911,6 @@ function startGuessMatch(roomCode) {
   }
 }
 
-// ---------- Pause عام لكل الألعاب ----------
 // المزاد عنده منطق pause خاص بيه (بيوقف التايمر فعليًا)، وأفلام كمان عندها
 // تايمر. باقي الألعاب مفيهاش تايمر فبنكتفي بعلامة paused اللي بتقفل الشاشة.
 function activeGameState(room) {
@@ -683,6 +926,15 @@ function pauseAnyGame(room, roomCode) {
     room.movies.pausedRemainingMs = Math.max(0, room.movies.endsAt - Date.now());
     if (room.movies.timeout) clearTimeout(room.movies.timeout);
     room.movies.timeout = null;
+    return true;
+  }
+
+  if (room.selectedGame === "mafia" && room.mafia) {
+    if (room.mafia.paused || room.mafia.phase !== "discussion") return false;
+    room.mafia.paused = true;
+    room.mafia.pausedRemainingMs = Math.max(0, room.mafia.discussionEndsAt - Date.now());
+    if (room.mafia.discussionTimeout) clearTimeout(room.mafia.discussionTimeout);
+    room.mafia.discussionTimeout = null;
     return true;
   }
 
@@ -702,6 +954,16 @@ function resumeAnyGame(room, roomCode) {
     room.movies.pausedRemainingMs = null;
     room.movies.endsAt = Date.now() + remaining;
     room.movies.timeout = setTimeout(() => endMoviesRound(roomCode, "timeout"), remaining + 300);
+    return true;
+  }
+
+  if (room.selectedGame === "mafia" && room.mafia) {
+    if (!room.mafia.paused) return false;
+    const remaining = room.mafia.pausedRemainingMs || 0;
+    room.mafia.paused = false;
+    room.mafia.pausedRemainingMs = null;
+    room.mafia.discussionEndsAt = Date.now() + remaining;
+    room.mafia.discussionTimeout = setTimeout(() => startMafiaVoting(roomCode), remaining + 300);
     return true;
   }
 
@@ -736,6 +998,13 @@ function endMatchForGame(room, roomCode) {
   if (gameId === "bus" && room.bus) {
     room.bus.ranking = buildRankingFromScores(room, room.bus.totals);
     room.bus.phase = "matchOver";
+    return true;
+  }
+  if (gameId === "mafia" && room.mafia) {
+    if (room.mafia.discussionTimeout) clearTimeout(room.mafia.discussionTimeout);
+    room.mafia.discussionTimeout = null;
+    room.mafia.winner = null; // اتقفلت بدري - مفيش فايز
+    room.mafia.phase = "gameover";
     return true;
   }
   // الألعاب اللي مفيهاش نقاط تراكمية: بننهيها من غير ترتيب
@@ -1016,7 +1285,7 @@ io.on("connection", (socket) => {
 
   // الهوست بيختار اللعبة اللي الأوضة هتلعبها. دلوقتي بس 'mazad' متاحة فعليًا -
   // أي لعبة تانية هتتضاف هنا لما يكون منطقها جاهز على السيرفر.
-  const IMPLEMENTED_GAMES = ["mazad", "sniper", "spy", "bus", "movies", "system", "guess"];
+  const IMPLEMENTED_GAMES = ["mazad", "sniper", "spy", "bus", "movies", "system", "guess", "mafia"];
   socket.on("host:selectGame", ({ gameId }) => {
     const roomCode = socket.data.roomCode;
     const room = rooms[roomCode];
@@ -1162,6 +1431,9 @@ io.on("connection", (socket) => {
       startSystemMatch(roomCode, null);
     } else if (gameId === "guess") {
       startGuessMatch(roomCode);
+    } else if (gameId === "mafia") {
+      room.mafia = null;
+      startMafiaMatch(roomCode, "random");
     }
   });
 
@@ -1567,6 +1839,154 @@ io.on("connection", (socket) => {
     const room = rooms[roomCode];
     if (!room || socket.id !== room.hostSocketId || room.selectedGame !== "guess") return;
     room.guess = null;
+    room.started = false;
+    room.phase = "lobby";
+    broadcastRoom(roomCode);
+  });
+
+  // ---------- أحداث لعبة مافيا ----------
+  socket.on("host:startMafiaMatch", ({ mafiaCount }) => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || socket.id !== room.hostSocketId || room.selectedGame !== "mafia" || room.started) return;
+    startMafiaMatch(roomCode, mafiaCount);
+  });
+
+  // أي مافيا يختار الهدف - الاختيار مشترك بين كل المافيا (لو أكتر من واحد)
+  socket.on("mafia:setTarget", ({ targetId }) => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || !room.mafia || room.mafia.phase !== "night") return;
+    const m = room.mafia;
+    if (m.roles[socket.id] !== "mafia" || !m.aliveIds.includes(socket.id)) return;
+    if (!m.aliveIds.includes(targetId) || m.roles[targetId] === "mafia") return;
+    m.nightTargetId = targetId;
+    broadcastRoom(roomCode);
+    tryAdvanceMafiaNight(roomCode);
+  });
+
+  // الدكتور يختار يعالج مين - وله حد لعلاج نفسه (مرتين بس، مش ورا بعض)
+  socket.on("doctor:setTarget", ({ targetId }) => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || !room.mafia || room.mafia.phase !== "night") return;
+    const m = room.mafia;
+    if (m.roles[socket.id] !== "doctor" || !m.aliveIds.includes(socket.id)) return;
+    if (!m.aliveIds.includes(targetId)) return;
+    if (targetId === socket.id) {
+      const usedSoFar = m.doctorSelfHealCounts[socket.id] || 0;
+      const lastRound = m.doctorLastSelfHealRound[socket.id];
+      if (usedSoFar >= 2 || lastRound === m.round - 1) {
+        socket.emit("game:error", "معاكش فرصة تعالج نفسك تاني دلوقتي.");
+        return;
+      }
+      m.doctorSelfHealCounts[socket.id] = usedSoFar + 1;
+      m.doctorLastSelfHealRound[socket.id] = m.round;
+    }
+    m.healTargetId = targetId;
+    broadcastRoom(roomCode);
+    tryAdvanceMafiaNight(roomCode);
+  });
+
+  // كل لاعب حي بيكتب وصيته (10-100 حرف)
+  socket.on("mafia:submitWill", ({ text }) => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || !room.mafia || room.mafia.phase !== "night") return;
+    const m = room.mafia;
+    if (!m.aliveIds.includes(socket.id)) return;
+    const trimmed = (text || "").trim();
+    if (trimmed.length < 10 || trimmed.length > 100) {
+      socket.emit("game:error", "من فضلك اكتب وصيتك.");
+      return;
+    }
+    m.wills[socket.id] = trimmed;
+    broadcastRoom(roomCode);
+    tryAdvanceMafiaNight(roomCode);
+  });
+
+  // زرار "التالي" العام - بيحرك اللعبة بين المراحل اللي محتاجة تأكيد من الهوست
+  socket.on("host:mafiaAdvance", () => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || socket.id !== room.hostSocketId || !room.mafia) return;
+    const m = room.mafia;
+
+    if (m.phase === "reveal_wills") {
+      if (checkMafiaWin(room)) {
+        broadcastRoom(roomCode);
+        return;
+      }
+      m.phase = "day_announce";
+      broadcastRoom(roomCode);
+      return;
+    }
+
+    if (m.phase === "day_announce") {
+      // لو محدش مات (الدكتور عالج صح)، مفيش داعي لنقاش ولا تصويت -
+      // نكمل على طول لليلة جديدة
+      if (!m.lastNightResult || !m.lastNightResult.killedId) {
+        m.round += 1;
+        m.phase = "night";
+        m.nightTargetId = null;
+        m.healTargetId = null;
+        m.wills = {};
+        m.willsRevealList = [];
+        m.lastNightResult = null;
+        m.votes = {};
+        m.voteCounts = null;
+        m.lastVoteOut = null;
+        broadcastRoom(roomCode);
+        return;
+      }
+      m.phase = "discussion";
+      m.discussionEndsAt = Date.now() + 90 * 1000;
+      m.discussionTimeout = setTimeout(() => startMafiaVoting(roomCode), 90 * 1000 + 300);
+      broadcastRoom(roomCode);
+      return;
+    }
+
+    if (m.phase === "discussion") {
+      if (m.discussionTimeout) clearTimeout(m.discussionTimeout);
+      startMafiaVoting(roomCode);
+      return;
+    }
+
+    if (m.phase === "vote_result") {
+      m.round += 1;
+      m.phase = "night";
+      m.nightTargetId = null;
+      m.healTargetId = null;
+      m.wills = {};
+      m.willsRevealList = [];
+      m.lastNightResult = null;
+      m.votes = {};
+      m.voteCounts = null;
+      m.lastVoteOut = null;
+      broadcastRoom(roomCode);
+      return;
+    }
+  });
+
+  socket.on("mafia:vote", ({ targetId }) => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || !room.mafia || room.mafia.phase !== "voting") return;
+    const m = room.mafia;
+    if (!m.aliveIds.includes(socket.id) || !m.aliveIds.includes(targetId)) return;
+    m.votes[socket.id] = targetId;
+    broadcastRoom(roomCode);
+    if (Object.keys(m.votes).length === m.aliveIds.length) {
+      resolveMafiaVote(roomCode);
+    }
+  });
+
+  socket.on("host:mafiaBackToLobby", () => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || socket.id !== room.hostSocketId || room.selectedGame !== "mafia") return;
+    if (room.mafia?.discussionTimeout) clearTimeout(room.mafia.discussionTimeout);
+    room.mafia = null;
     room.started = false;
     room.phase = "lobby";
     broadcastRoom(roomCode);
