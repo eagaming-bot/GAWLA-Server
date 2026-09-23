@@ -3,6 +3,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const { getPool, CATEGORY_KEYS } = require("./words");
+const { randomInt, shuffleArray: strongShuffleArray } = require("./strongRandom");
 const { pickFresh } = require("./freshPicker");
 const { MOVIES, SYSTEMS, GUESS_WORDS } = require("./data/gameBanks");
 
@@ -59,7 +60,7 @@ function makeRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code;
   do {
-    code = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join("");
+    code = Array.from({ length: 4 }, () => chars[randomInt(chars.length)]).join("");
   } while (rooms[code]);
   return code;
 }
@@ -351,7 +352,7 @@ function pickPlayerForTeam(room, teamId) {
     if (c < minCount) minCount = c;
   }
   const candidates = team.playerIds.filter((pid) => (team.appearances[pid] || 0) === minCount);
-  const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+  const chosen = candidates[randomInt(candidates.length)];
   team.appearances[chosen] = (team.appearances[chosen] || 0) + 1;
   // لو الكل وصل لـ3 ظهورات، نبدأ دورة جديدة
   const allDone = team.playerIds.every((pid) => (team.appearances[pid] || 0) >= 3);
@@ -384,7 +385,7 @@ function startSniperMatch(roomCode) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ القناص.");
     return;
   }
-  const sniperId = playerIds[Math.floor(Math.random() * playerIds.length)];
+  const sniperId = playerIds[randomInt(playerIds.length)];
   room.sniper = {
     playerOrder: playerIds.slice(),
     sniperId,
@@ -455,10 +456,10 @@ function endSniperMatchIfActive(room, roomCode) {
 
 // ---------- لعبة الجاسوس ----------
 function pickRandomPair(playerIds) {
-  const askerId = playerIds[Math.floor(Math.random() * playerIds.length)];
+  const askerId = playerIds[randomInt(playerIds.length)];
   let targetId = askerId;
   while (targetId === askerId) {
-    targetId = playerIds[Math.floor(Math.random() * playerIds.length)];
+    targetId = playerIds[randomInt(playerIds.length)];
   }
   return { askerId, targetId };
 }
@@ -469,7 +470,7 @@ function startSpyMatch(roomCode, category) {
   // "عشوائي" = اللعبة تختار كاتيجوري من الموجودين بنفسها
   const resolvedCategory =
     category === "random"
-      ? Object.keys(SPY_BANKS)[Math.floor(Math.random() * Object.keys(SPY_BANKS).length)]
+      ? Object.keys(SPY_BANKS)[randomInt(Object.keys(SPY_BANKS).length)]
       : category;
   const bank = SPY_BANKS[resolvedCategory];
   if (!bank) return;
@@ -478,7 +479,7 @@ function startSpyMatch(roomCode, category) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ الجاسوس.");
     return;
   }
-  const spyId = playerIds[Math.floor(Math.random() * playerIds.length)];
+  const spyId = playerIds[randomInt(playerIds.length)];
   const word = pickFresh(`spy:${resolvedCategory}`, bank.items);
   room.spy = {
     category: resolvedCategory,
@@ -600,7 +601,7 @@ function startMoviesRound(roomCode, keepScores) {
   const teamPlayers = room.teams[currentTeamId].playerIds;
   const minSeen = Math.min(...teamPlayers.map((pid) => appearances[pid] || 0));
   const candidates = teamPlayers.filter((pid) => (appearances[pid] || 0) === minSeen);
-  const actorId = candidates[Math.floor(Math.random() * candidates.length)];
+  const actorId = candidates[randomInt(candidates.length)];
   appearances[actorId] = (appearances[actorId] || 0) + 1;
 
   const film = pickFresh("movies", MOVIES);
@@ -658,7 +659,7 @@ function startSystemMatch(roomCode, customText) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ سيستم.");
     return;
   }
-  const unawareId = playerIds[Math.floor(Math.random() * playerIds.length)];
+  const unawareId = playerIds[randomInt(playerIds.length)];
   const isCustom = !!(customText && customText.trim());
   const systemText = isCustom ? customText.trim() : pickFresh("system", SYSTEMS, (s) => s.id).text;
 
@@ -727,7 +728,7 @@ function pickDoctorCount(n, mafiaCount) {
 function shuffleArray(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = randomInt((i + 1));
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
@@ -892,7 +893,7 @@ function startGuessMatch(roomCode) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ خمن.");
     return;
   }
-  const guesserId = playerIds[Math.floor(Math.random() * playerIds.length)];
+  const guesserId = playerIds[randomInt(playerIds.length)];
   const others = playerIds.filter((id) => id !== guesserId);
   const word = pickFresh("guess", GUESS_WORDS);
 
@@ -901,7 +902,7 @@ function startGuessMatch(roomCode) {
     guesserId,
     word,
     // اللعبة هي اللي بتحدد مين يتسأل، مش الخمّان
-    turn: others[Math.floor(Math.random() * others.length)],
+    turn: others[randomInt(others.length)],
     askedIds: [],
     phase: "asking",
     guessText: null,
@@ -1261,7 +1262,7 @@ io.on("connection", (socket) => {
     room.players[socket.id] = {
       name: (name || "Host").trim() || "Host",
       teamId: null,
-      avatarId: Math.floor(Math.random() * AVATAR_COUNT),
+      avatarId: randomInt(AVATAR_COUNT),
     };
     rooms[roomCode] = room;
     socket.join(roomCode);
@@ -1284,7 +1285,7 @@ io.on("connection", (socket) => {
     room.players[socket.id] = {
       name: (name || "لاعب").trim() || "لاعب",
       teamId: null,
-      avatarId: Math.floor(Math.random() * AVATAR_COUNT),
+      avatarId: randomInt(AVATAR_COUNT),
     };
     socket.join(roomCode);
     socket.data.roomCode = roomCode;
@@ -1826,7 +1827,7 @@ io.on("connection", (socket) => {
     // لو الكل اتسأل، بنبدأ لفة جديدة من الأول
     const pool = remaining.length > 0 ? remaining : g.playerOrder.filter((id) => id !== g.guesserId);
     if (remaining.length === 0) g.askedIds = [];
-    g.turn = pool[Math.floor(Math.random() * pool.length)];
+    g.turn = pool[randomInt(pool.length)];
     broadcastRoom(roomCode);
   });
 
