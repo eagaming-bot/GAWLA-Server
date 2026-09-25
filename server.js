@@ -964,15 +964,6 @@ function pauseAnyGame(room, roomCode) {
     return true;
   }
 
-  if (room.selectedGame === "mafia" && room.mafia) {
-    if (room.mafia.paused || room.mafia.phase !== "discussion") return false;
-    room.mafia.paused = true;
-    room.mafia.pausedRemainingMs = Math.max(0, room.mafia.discussionEndsAt - Date.now());
-    if (room.mafia.discussionTimeout) clearTimeout(room.mafia.discussionTimeout);
-    room.mafia.discussionTimeout = null;
-    return true;
-  }
-
   const g = activeGameState(room);
   if (!g || g.paused) return false;
   g.paused = true;
@@ -989,16 +980,6 @@ function resumeAnyGame(room, roomCode) {
     room.movies.pausedRemainingMs = null;
     room.movies.endsAt = Date.now() + remaining;
     room.movies.timeout = setTimeout(() => endMoviesRound(roomCode, "timeout"), remaining + 300);
-    return true;
-  }
-
-  if (room.selectedGame === "mafia" && room.mafia) {
-    if (!room.mafia.paused) return false;
-    const remaining = room.mafia.pausedRemainingMs || 0;
-    room.mafia.paused = false;
-    room.mafia.pausedRemainingMs = null;
-    room.mafia.discussionEndsAt = Date.now() + remaining;
-    room.mafia.discussionTimeout = setTimeout(() => startMafiaVoting(roomCode), remaining + 300);
     return true;
   }
 
@@ -1979,14 +1960,11 @@ io.on("connection", (socket) => {
         return;
       }
       m.phase = "discussion";
-      m.discussionEndsAt = Date.now() + 90 * 1000;
-      m.discussionTimeout = setTimeout(() => startMafiaVoting(roomCode), 90 * 1000 + 300);
       broadcastRoom(roomCode);
       return;
     }
 
     if (m.phase === "discussion") {
-      if (m.discussionTimeout) clearTimeout(m.discussionTimeout);
       startMafiaVoting(roomCode);
       return;
     }
