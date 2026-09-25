@@ -1792,9 +1792,8 @@ io.on("connection", (socket) => {
     const room = rooms[roomCode];
     if (!room || room.selectedGame !== "system" || !room.system || room.system.phase !== "guessing") return;
     if (socket.id !== room.system.unawareId) return;
-    room.system.guessText = guess;
     room.system.phase = "reveal";
-    // التخمين هنا وصفي مش نص حرفي، فالهوست هو اللي بيحكم صح ولا غلط
+    // مفيش تخمين مكتوب خالص - اللاعب بيقول رأيه بصوته، والهوست هو اللي بيحكم صح ولا غلط
     broadcastRoom(roomCode);
   });
 
@@ -1805,6 +1804,13 @@ io.on("connection", (socket) => {
     room.system.correct = !!correct;
     room.system.phase = "reveal";
     broadcastRoom(roomCode);
+  });
+
+  socket.on("host:systemRematch", () => {
+    const roomCode = socket.data.roomCode;
+    const room = rooms[roomCode];
+    if (!room || socket.id !== room.hostSocketId || room.selectedGame !== "system") return;
+    startSystemMatch(roomCode);
   });
 
   socket.on("host:systemBackToLobby", () => {
