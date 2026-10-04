@@ -5,7 +5,7 @@ const { Server } = require("socket.io");
 const { getPool, CATEGORY_KEYS } = require("./words");
 const { randomInt, shuffleArray: strongShuffleArray } = require("./strongRandom");
 const { pickFresh } = require("./freshPicker");
-const { MOVIES, SYSTEMS, GUESS_WORDS } = require("./data/gameBanks");
+const { MOVIES, SYSTEMS, GUESS_BANKS } = require("./data/gameBanks");
 
 // كل نقطة بتتحسب 15 (يعني 15/30/45...) بدل 1/2/3
 const POINT_UNIT = 15;
@@ -44,6 +44,10 @@ const SPY_BANKS = {
     label: "أكلة",
     items: ["كشري", "ملوخية", "فول ومدمس", "مسقعة", "محشي", "كباب", "بيتزا", "شاورما", "فراخ مشوية", "مكرونة بشاميل", "طعمية", "حمام محشي", "رز بلبن", "كنافة", "فتة", "سمك مشوي", "كبدة اسكندراني", "حواوشي", "فطير مشلتت", "بط مشوي", "أرز معمر", "مكرونة بالصلصة", "لحمة ضاني", "كفتة", "سجق", "بسطرمة", "جبنة قديمة", "فينو بالطعمية", "مخلل", "بامية", "بازلاء بالجزر", "كوارع", "ممبار", "فتة كوارع", "رقاق باللحمة", "سمبوسك", "ورق عنب", "كبيبة", "شيش طاووق", "برجر", "هوت دوج", "بطاطس محمرة", "سلطة بلدي", "تبولة", "حمص بطحينة", "بابا غنوج", "زبادي بالخيار", "شوربة عدس", "شوربة لسان عصفور", "كنافة بالمكسرات", "بسبوسة", "أم علي", "أرز باللبن", "بلح الشام", "زلابية", "قطايف", "كحك", "غريبة", "بقلاوة", "علبة شوكولاتة"],
   },
+  celebrity: {
+    label: "شخصيات",
+    items: ["محمد صلاح", "عمرو دياب", "تامر حسني", "أم كلثوم", "عبدالحليم حافظ", "عادل إمام", "محمد هنيدي", "أحمد حلمي", "كريم عبدالعزيز", "ياسمين عبدالعزيز", "منى زكي", "إلهام شاهين", "محمد رمضان", "أحمد السقا", "آسر ياسين", "خالد الصاوي", "زياد ظاظا", "محمد عبدالعاطي", "حمو بيكا", "حسن شاكوش", "مروان بابلو", "ويجز", "أبو تريكة", "الكابتن حسن شحاتة", "بيبو", "فيفي عبده", "شيكو", "سعد الصغير", "توتا", "شعبان عبدالرحيم", "أنغام", "شيرين", "نانسي عجرم", "إليسا", "رامز جلال", "دنيا سمير غانم", "بوسي شلبي", "هشام الهداية"],
+  },
 };
 
 const app = express();
@@ -69,6 +73,78 @@ function makeRoomCode() {
     code = Array.from({ length: 4 }, () => chars[randomInt(chars.length)]).join("");
   } while (rooms[code]);
   return code;
+}
+
+// مدة السماح قبل ما نشيل لاعب فعليًا لو اتقطع (قفل الموبايل، التطبيق راح
+// للخلفية، نت اتقطع لحظيًا، إلخ) - يفضل مكانه محجوز خلال المدة دي
+const RECONNECT_GRACE_MS = 45000;
+
+// بيستبدل أي ظهور لـ oldId بـ newId فى كل حالة الغرفة - سواء كمفتاح فى
+// object (زي أدوار مافيا)، أو قيمة جوه array (زي playerIds بتاعة فريق)،
+// أو قيمة مباشرة (زي spyId). كده مش محتاجين نكتب منطق خاص لكل لعبة.
+function remapPlayerId(room, oldId, newId) {
+  if (oldId === newId) return;
+  if (room.players[oldId]) {
+    room.players[newId] = room.players[oldId];
+    delete room.players[oldId];
+  }
+  if (room.hostSocketId === oldId) room.hostSocketId = newId;
+
+  function walk(obj, seen) {
+    if (obj == null || typeof obj !== "object") return;
+    if (seen.has(obj)) return;
+    seen.add(obj);
+    if (Array.isArray(obj)) {
+      for (let i = 0; i < obj.length; i++) {
+        if (obj[i] === oldId) obj[i] = newId;
+        else walk(obj[i], seen);
+      }
+      return;
+    }
+    for (const key of Object.keys(obj)) {
+      if (key === oldId) {
+        obj[newId] = obj[oldId];
+        delete obj[oldId];
+      }
+    }
+    for (const key of Object.keys(obj)) {
+      if (obj[key] === oldId) obj[key] = newId;
+      else walk(obj[key], seen);
+    }
+  }
+  const seen = new Set();
+  for (const key of Object.keys(room)) {
+    if (key === "players" || key === "hostSocketId") continue;
+    walk(room[key], seen);
+  }
+}
+
+// لما لاعب يرجع بعد انقطاع، لازم نرجعله أي معلومة سرية كانت اتبعتله لوحده
+// (زي دوره فى اللعبة الشغالة دلوقتي) - مش موجودة فى البرودكاست العام
+function resendPrivateStateOnRejoin(room, pid) {
+  const g = room.selectedGame;
+  if (g === "sniper" && room.sniper) {
+    io.to(pid).emit("sniper:role", { role: pid === room.sniper.sniperId ? "sniper" : "target" });
+  } else if (g === "spy" && room.spy) {
+    const s = room.spy;
+    if (pid === s.spyId) io.to(pid).emit("spy:role", { role: "spy", category: s.category, categoryLabel: s.categoryLabel });
+    else io.to(pid).emit("spy:role", { role: "civilian", category: s.category, categoryLabel: s.categoryLabel, word: s.word });
+  } else if (g === "system" && room.system) {
+    const sys = room.system;
+    if (pid === sys.unawareId) io.to(pid).emit("system:role", { role: "unaware" });
+    else io.to(pid).emit("system:role", { role: "aware", systemText: sys.systemText });
+  } else if (g === "guess" && room.guess) {
+    const gs = room.guess;
+    if (pid === gs.guesserId) io.to(pid).emit("guess:role", { role: "guesser" });
+    else io.to(pid).emit("guess:role", { role: "knower", word: gs.word });
+  } else if (g === "mafia" && room.mafia && room.mafia.roles) {
+    const m = room.mafia;
+    const role = m.roles[pid];
+    if (role) {
+      const mafiaIds = Object.keys(m.roles).filter((id) => m.roles[id] === "mafia");
+      io.to(pid).emit("mafia:role", { role, teammates: role === "mafia" ? mafiaIds.filter((id) => id !== pid) : [] });
+    }
+  }
 }
 
 function newRoom(hostSocketId) {
@@ -132,12 +208,16 @@ function publicRoomState(room, roomCode) {
             id: pid,
             name: room.players[pid] ? room.players[pid].name : "؟",
             avatarId: room.players[pid] ? room.players[pid].avatarId : 0,
+            disconnected: room.players[pid] ? !!room.players[pid].disconnected : false,
           })),
         },
       ])
     ),
     players: Object.fromEntries(
-      Object.entries(room.players).map(([id, p]) => [id, { name: p.name, teamId: p.teamId, avatarId: p.avatarId }])
+      Object.entries(room.players).map(([id, p]) => [
+        id,
+        { name: p.name, teamId: p.teamId, avatarId: p.avatarId, disconnected: !!p.disconnected },
+      ])
     ),
     round: room.round
       ? {
@@ -565,6 +645,13 @@ function startBusRound(roomCode, categoryIds, keepTotals) {
 
 // بيحسب نقط الجولة: إجابة صح ومنفردة = نقطة، ومكررة = نص نقطة،
 // وفاضية أو الهوست شطبها = صفر.
+// حرف واحد بس، أو رموز/علامات من غير حروف فعلية (زي "!!" أو "123" لوحدها)
+// منعتبرهاش إجابة صحيحة خالص
+function isValidBusAnswer(value) {
+  if (!value || value.length < 2) return false;
+  return /[a-zA-Z\u0600-\u06FF]/.test(value); // لازم يحتوي على حرف عربي أو إنجليزي واحد على الأقل
+}
+
 function computeBusScores(room) {
   const bus = room.bus;
   const normalize = (s) => (s || "").trim().toLowerCase();
@@ -578,13 +665,13 @@ function computeBusScores(room) {
     for (const pid of bus.playerOrder) {
       if (bus.rejected[`${pid}:${category.id}`]) continue;
       const value = normalize(bus.answers[pid]?.[category.id]);
-      if (!value) continue;
+      if (!isValidBusAnswer(value)) continue;
       valueCounts[value] = (valueCounts[value] || 0) + 1;
     }
     for (const pid of bus.playerOrder) {
       if (bus.rejected[`${pid}:${category.id}`]) continue;
       const value = normalize(bus.answers[pid]?.[category.id]);
-      if (!value) continue;
+      if (!isValidBusAnswer(value)) continue;
       roundScores[pid] += valueCounts[value] === 1 ? POINT_UNIT : DUPLICATE_UNIT;
     }
   }
@@ -596,7 +683,7 @@ function computeBusScores(room) {
     for (const pid of bus.playerOrder) {
       if (bus.rejected[`${pid}:${category.id}`]) continue;
       const value = normalize(bus.answers[pid]?.[category.id]);
-      if (!value) continue;
+      if (!isValidBusAnswer(value)) continue;
       valueCounts[value] = (valueCounts[value] || 0) + 1;
     }
     for (const [value, count] of Object.entries(valueCounts)) {
@@ -914,7 +1001,7 @@ function resolveMafiaVote(roomCode) {
   broadcastRoom(roomCode);
 }
 
-function startGuessMatch(roomCode) {
+function startGuessMatch(roomCode, category) {
   const room = rooms[roomCode];
   if (!room) return;
   const playerIds = Object.keys(room.players);
@@ -922,13 +1009,16 @@ function startGuessMatch(roomCode) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ خمن.");
     return;
   }
+  const resolvedCategory = GUESS_BANKS[category] ? category : "random";
+  const bank = GUESS_BANKS[resolvedCategory];
   const guesserId = playerIds[randomInt(playerIds.length)];
   const others = playerIds.filter((id) => id !== guesserId);
-  const word = pickFresh("guess", GUESS_WORDS);
+  const word = pickFresh(`guess:${resolvedCategory}`, bank.items);
 
   room.guess = {
     playerOrder: playerIds.slice(),
     guesserId,
+    category: resolvedCategory,
     word,
     // اللعبة هي اللي بتحدد مين يتسأل، مش الخمّان
     turn: others[randomInt(others.length)],
@@ -1266,13 +1356,14 @@ function checkGameOver(roomCode, next) {
 
 // ---------- Socket handlers ----------
 io.on("connection", (socket) => {
-  socket.on("host:create", ({ name }) => {
+  socket.on("host:create", ({ name, token }) => {
     const roomCode = makeRoomCode();
     const room = newRoom(socket.id);
     room.players[socket.id] = {
       name: (name || "Host").trim() || "Host",
       teamId: null,
       avatarId: randomInt(AVATAR_COUNT),
+      token: token || socket.id, // هوية ثابتة بتفضل زيها لو الاتصال اتقطع ورجع
     };
     rooms[roomCode] = room;
     socket.join(roomCode);
@@ -1281,7 +1372,7 @@ io.on("connection", (socket) => {
     broadcastRoom(roomCode);
   });
 
-  socket.on("player:join", ({ roomCode, name }) => {
+  socket.on("player:join", ({ roomCode, name, token }) => {
     roomCode = (roomCode || "").toUpperCase().trim();
     const room = rooms[roomCode];
     if (!room) {
@@ -1296,10 +1387,40 @@ io.on("connection", (socket) => {
       name: (name || "لاعب").trim() || "لاعب",
       teamId: null,
       avatarId: randomInt(AVATAR_COUNT),
+      token: token || socket.id,
     };
     socket.join(roomCode);
     socket.data.roomCode = roomCode;
     socket.emit("you:joined", { roomCode, id: socket.id, isHost: false });
+    broadcastRoom(roomCode);
+  });
+
+  // لاعب كان متصل، اتقطع (قفل الموبايل، التطبيق راح للخلفية، نت اتقطع)،
+  // ورجع يفتح تاني خلال مدة السماح - بيرجع لنفس مكانه بالظبط
+  socket.on("player:rejoin", ({ roomCode, token }) => {
+    roomCode = (roomCode || "").toUpperCase().trim();
+    const room = rooms[roomCode];
+    if (!room) {
+      socket.emit("game:error", "الغرفة مش موجودة أو خلصت.");
+      return;
+    }
+    const oldId = Object.keys(room.players).find(
+      (id) => room.players[id].disconnected && token && room.players[id].token === token
+    );
+    if (!oldId) {
+      socket.emit("game:error", "مقدرش ألاقي مكانك فى الغرفة، جرب تدخل من الأول.");
+      return;
+    }
+    const player = room.players[oldId];
+    if (player.graceTimeout) clearTimeout(player.graceTimeout);
+    remapPlayerId(room, oldId, socket.id);
+    room.players[socket.id].disconnected = false;
+    room.players[socket.id].graceTimeout = null;
+    socket.join(roomCode);
+    socket.data.roomCode = roomCode;
+    const isHost = room.hostSocketId === socket.id;
+    socket.emit("you:joined", { roomCode, id: socket.id, isHost });
+    resendPrivateStateOnRejoin(room, socket.id);
     broadcastRoom(roomCode);
   });
 
@@ -1450,7 +1571,7 @@ io.on("connection", (socket) => {
     } else if (gameId === "system") {
       startSystemMatch(roomCode, null);
     } else if (gameId === "guess") {
-      startGuessMatch(roomCode);
+      startGuessMatch(roomCode, room.guess?.category || "random");
     } else if (gameId === "mafia") {
       room.mafia = null;
       startMafiaMatch(roomCode, "random");
@@ -1824,11 +1945,11 @@ io.on("connection", (socket) => {
   });
 
   // ---------- أحداث لعبة خمن ----------
-  socket.on("host:startGuessMatch", () => {
+  socket.on("host:startGuessMatch", ({ category } = {}) => {
     const roomCode = socket.data.roomCode;
     const room = rooms[roomCode];
     if (!room || socket.id !== room.hostSocketId || room.selectedGame !== "guess" || room.started) return;
-    startGuessMatch(roomCode);
+    startGuessMatch(roomCode, category);
   });
 
   // الخمّان خلص سؤاله مع الشخص الحالي - اللعبة تختار الشخص اللي بعده
@@ -2140,21 +2261,37 @@ io.on("connection", (socket) => {
     const room = rooms[roomCode];
     if (!room) return;
     const player = room.players[socket.id];
-    if (player && player.teamId && room.teams[player.teamId]) {
-      handleMidRoundDeparture(roomCode, socket.id);
-      room.teams[player.teamId].playerIds = room.teams[player.teamId].playerIds.filter((id) => id !== socket.id);
-    }
-    endSniperMatchIfActive(room, roomCode);
-    delete room.players[socket.id];
-    if (socket.id === room.hostSocketId) {
-      io.to(roomCode).emit("game:ended", { reason: "host_left" });
-      clearRoundTimers(room);
-      delete rooms[roomCode];
-      return;
-    }
+    if (!player) return;
+    // مش بنشيله فورًا - بنديله مدة سماح يرجع فيها (قفل الموبايل، التطبيق
+    // راح للخلفية، نت اتقطع لحظيًا) قبل ما نعتبره خارج فعليًا
+    player.disconnected = true;
     broadcastRoom(roomCode);
+    player.graceTimeout = setTimeout(() => {
+      finalizePlayerRemoval(roomCode, socket.id);
+    }, RECONNECT_GRACE_MS);
   });
 });
+
+// الإزالة الفعلية للاعب بعد ما مدة السماح تخلص من غير ما يرجع
+function finalizePlayerRemoval(roomCode, socketId) {
+  const room = rooms[roomCode];
+  if (!room) return;
+  const player = room.players[socketId];
+  if (!player || !player.disconnected) return; // رجع فعلاً قبل كده، منلمسهوش
+  if (player.teamId && room.teams[player.teamId]) {
+    handleMidRoundDeparture(roomCode, socketId);
+    room.teams[player.teamId].playerIds = room.teams[player.teamId].playerIds.filter((id) => id !== socketId);
+  }
+  endSniperMatchIfActive(room, roomCode);
+  delete room.players[socketId];
+  if (socketId === room.hostSocketId) {
+    io.to(roomCode).emit("game:ended", { reason: "host_left" });
+    clearRoundTimers(room);
+    delete rooms[roomCode];
+    return;
+  }
+  broadcastRoom(roomCode);
+}
 
 // أي طلب مباشر على أي مسار (زي فتح لينك الغرفة مباشرة، أو عمل Refresh
 // فى نص اللعبة) بيرجّع نفس صفحة اللعبة (index.html) - التطبيق نفسه بيتولى
