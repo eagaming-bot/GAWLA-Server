@@ -198,6 +198,9 @@ function publicRoomState(room, roomCode) {
       room.phase === "explainWithdrawn" && room.round?.pendingWithdrawTeamId
         ? room.teams[room.round.pendingWithdrawTeamId]?.name || "؟"
         : null,
+    // الفاصل بين فريق وفريق بيحصل لسببين: انسحاب أو خلص وقته
+    lastHandoffReason:
+      room.phase === "explainWithdrawn" ? room.round?.pendingHandoffReason || "withdraw" : null,
     serverNow: Date.now(),
     teams: Object.fromEntries(
       Object.entries(room.teams).map(([teamId, t]) => [
@@ -285,7 +288,8 @@ function publicRoomState(room, roomCode) {
           submittedIds: Object.keys(room.bus.answers),
           totalPlayers: room.bus.playerOrder.length,
           // الإجابات متتكشفش إلا بعد ما الجولة تقف - عشان محدش ينقل من حد
-          answers: room.bus.phase === "writing" ? null : room.bus.answers,
+          // الإجابات اللي مش كلام فعلي (علامات/شطب/رموز) متتكتبش فى الجدول خالص
+          answers: room.bus.phase === "writing" ? null : sanitizeBusAnswers(room.bus),
           rejected: room.bus.rejected,
           duplicates: room.bus.duplicates || {},
           roundScores: room.bus.phase === "results" ? room.bus.roundScores : null,
@@ -683,6 +687,22 @@ function startBusRound(roomCode, categoryIds, keepTotals) {
 function isValidBusAnswer(value) {
   if (!value || value.length < 2) return false;
   return /[a-zA-Z\u0600-\u06FF]/.test(value); // لازم يحتوي على حرف عربي أو إنجليزي واحد على الأقل
+}
+
+// الإجابات اللى مش كلمة حقيقية (علامة، شطبة، رموز، رقم لوحده) أصلاً بصفر فى الحساب،
+// فمش المفروض تتعرض فى الجدول كمان - بنفضيها قبل ما تتبعت للكلاينت
+function sanitizeBusAnswers(bus) {
+  const out = {};
+  for (const pid of Object.keys(bus.answers || {})) {
+    const row = bus.answers[pid] || {};
+    const clean = {};
+    for (const category of bus.categories) {
+      const raw = (row[category.id] || "").trim();
+      clean[category.id] = isValidBusAnswer(raw.toLowerCase()) ? row[category.id] : "";
+    }
+    out[pid] = clean;
+  }
+  return out;
 }
 
 function computeBusScores(room) {
@@ -1263,6 +1283,8 @@ function advanceToNextBidder(roomCode) {
   const bidValue = room.round.bids[teamId].value;
   const sel = room.round.selections[teamId];
 
+  room.round.pendingWithdrawTeamId = null;
+  room.round.pendingHandoffReason = null;
   room.phase = "explain";
   room.round.explain = {
     teamId,
@@ -1298,6 +1320,19 @@ function onExplainTimeout(roomCode) {
     teamId,
     teamName: room.teams[teamId] ? room.teams[teamId].name : "؟",
   });
+
+  // لو فيه فريق تاني لسه ليه دور، نوقف على شاشة فاصلة الأول بدل ما تايمر
+  // الفريق الجديد يبدأ فى نفس اللحظة اللي خلص فيها وقت اللي قبله.
+  // لو ده كان آخر فريق، التصويت نفسه بيبقى هو الفاصل فمفيش داعي لشاشة زيادة.
+  const hasNextBidder = room.round.bidOrderIndex + 1 < room.round.bidOrder.length;
+  if (hasNextBidder) {
+    room.phase = "explainWithdrawn";
+    room.round.pendingWithdrawTeamId = teamId;
+    room.round.pendingHandoffReason = "timeout";
+    broadcastRoom(roomCode);
+    return;
+  }
+
   advanceToNextBidder(roomCode);
 }
 
@@ -1312,6 +1347,7 @@ function onWithdraw(roomCode, requesterId) {
   // فورًا من غير ما الكل ياخد لحظة يستوعب إن اللي فات انسحب.
   room.phase = "explainWithdrawn";
   room.round.pendingWithdrawTeamId = teamId;
+  room.round.pendingHandoffReason = "withdraw";
   io.to(roomCode).emit("explain:withdrawn", {
     teamId,
     teamName: room.teams[teamId] ? room.teams[teamId].name : "؟",
@@ -1675,11 +1711,16 @@ io.on("connection", (socket) => {
     if (s.eliminatedOrder.includes(socket.id)) return; // دوسها قبل كده
     s.eliminatedOrder.push(socket.id);
 
-    // أول ما يفضل شخص واحد بس معندوش "اتقتلت" (غير القناص لو كسل يدوسها)، هو ده اللي هيخمن
-    const totalPlayers = s.playerOrder.length;
-    if (s.eliminatedOrder.length === totalPlayers - 1 && !s.guesserId) {
-      s.guesserId = socket.id;
-      s.phase = "guessing";
+    // أول ما يفضل شخص واحد بس معندوش "اتقتلت" (غير القناص لو كسل يدوسها)، هو ده اللي هيخمن.
+    // لازم يبقى الشخص اللي *لسه عايش* - مش اللي لسه دايس اتقتلت دلوقتي.
+    if (!s.guesserId) {
+      const stillAlive = s.playerOrder.filter(
+        (pid) => !s.eliminatedOrder.includes(pid) && room.players[pid]
+      );
+      if (stillAlive.length === 1) {
+        s.guesserId = stillAlive[0];
+        s.phase = "guessing";
+      }
     }
     broadcastRoom(roomCode);
   });
