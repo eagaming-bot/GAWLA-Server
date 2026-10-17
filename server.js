@@ -77,7 +77,7 @@ function makeRoomCode() {
 
 // مدة السماح قبل ما نشيل لاعب فعليًا لو اتقطع (قفل الموبايل، التطبيق راح
 // للخلفية، نت اتقطع لحظيًا، إلخ) - يفضل مكانه محجوز خلال المدة دي
-const RECONNECT_GRACE_MS = 45000;
+const RECONNECT_GRACE_MS = 120000; // دقيقتين - كفاية إن حد يفتح واتساب/لينك ويرجع
 
 // بيستبدل أي ظهور لـ oldId بـ newId فى كل حالة الغرفة - سواء كمفتاح فى
 // object (زي أدوار مافيا)، أو قيمة جوه array (زي playerIds بتاعة فريق)،
@@ -119,9 +119,65 @@ function remapPlayerId(room, oldId, newId) {
   }
 }
 
+// ---------- لاعبين داخلين متأخر / فاصلين وقت بداية الماتش ----------
+// اللاعب اللي بيدخل والماتش شغال (أو اللي فاصل لحظة الضغط على "ابدأ") بيتعلّم
+// late=true: بيفضل فى الغرفة وبيشوف شاشة "استنى الماتش الجاي"، ومش بيدخل
+// فى الماتش الحالي ولا بيقفله لو خرج. أول ماتش بعد كده بيدخل فيه عادي.
+function startablePlayerIds(room) {
+  const ids = [];
+  for (const [id, p] of Object.entries(room.players)) {
+    if (p.disconnected) {
+      p.late = true;
+    } else {
+      p.late = false;
+      ids.push(id);
+    }
+  }
+  return ids;
+}
+
+function activateWaitingPlayers(room) {
+  for (const p of Object.values(room.players)) {
+    if (!p.disconnected) p.late = false;
+  }
+}
+
+function findPlayerIdByToken(room, token) {
+  if (!token) return null;
+  return Object.keys(room.players).find((id) => room.players[id].token === token) || null;
+}
+
+// بيربط السوكيت الجديد بمكان اللاعب القديم (نفس الجهاز) - سواء كان فاصل
+// فعلاً أو لسه السيرفر ماحسش بفصله (الموبايل بيرجع أسرع من الـ ping timeout)
+function attachSocketToPlayer(socket, roomCode, room, oldId) {
+  const player = room.players[oldId];
+  if (!player) return;
+  if (player.graceTimeout) clearTimeout(player.graceTimeout);
+  if (oldId !== socket.id) {
+    const oldSock = io.sockets.sockets.get(oldId);
+    if (oldSock) {
+      oldSock.data.roomCode = null;
+      oldSock.leave(roomCode);
+      oldSock.disconnect(true);
+    }
+    remapPlayerId(room, oldId, socket.id);
+  }
+  const me = room.players[socket.id];
+  me.disconnected = false;
+  me.graceTimeout = null;
+  socket.join(roomCode);
+  socket.data.roomCode = roomCode;
+  const isHost = room.hostSocketId === socket.id;
+  socket.emit("you:joined", { roomCode, id: socket.id, isHost });
+  resendPrivateStateOnRejoin(room, socket.id);
+  broadcastRoom(roomCode);
+}
+
 // لما لاعب يرجع بعد انقطاع، لازم نرجعله أي معلومة سرية كانت اتبعتله لوحده
 // (زي دوره فى اللعبة الشغالة دلوقتي) - مش موجودة فى البرودكاست العام
 function resendPrivateStateOnRejoin(room, pid) {
+  // اللاعب المنتظر (داخل متأخر) مالوش دور فى الماتش الحالي - منبعتلوش أي حاجة سرية
+  if (room.players[pid] && room.players[pid].late && room.started) return;
   const g = room.selectedGame;
   if (g === "sniper" && room.sniper) {
     io.to(pid).emit("sniper:role", { role: pid === room.sniper.sniperId ? "sniper" : "target" });
@@ -198,9 +254,6 @@ function publicRoomState(room, roomCode) {
       room.phase === "explainWithdrawn" && room.round?.pendingWithdrawTeamId
         ? room.teams[room.round.pendingWithdrawTeamId]?.name || "؟"
         : null,
-    // الفاصل بين فريق وفريق بيحصل لسببين: انسحاب أو خلص وقته
-    lastHandoffReason:
-      room.phase === "explainWithdrawn" ? room.round?.pendingHandoffReason || "withdraw" : null,
     serverNow: Date.now(),
     teams: Object.fromEntries(
       Object.entries(room.teams).map(([teamId, t]) => [
@@ -219,7 +272,7 @@ function publicRoomState(room, roomCode) {
     players: Object.fromEntries(
       Object.entries(room.players).map(([id, p]) => [
         id,
-        { name: p.name, teamId: p.teamId, avatarId: p.avatarId, disconnected: !!p.disconnected },
+        { name: p.name, teamId: p.teamId, avatarId: p.avatarId, disconnected: !!p.disconnected, late: !!p.late && !!room.started },
       ])
     ),
     round: room.round
@@ -288,8 +341,7 @@ function publicRoomState(room, roomCode) {
           submittedIds: Object.keys(room.bus.answers),
           totalPlayers: room.bus.playerOrder.length,
           // الإجابات متتكشفش إلا بعد ما الجولة تقف - عشان محدش ينقل من حد
-          // الإجابات اللي مش كلام فعلي (علامات/شطب/رموز) متتكتبش فى الجدول خالص
-          answers: room.bus.phase === "writing" ? null : sanitizeBusAnswers(room.bus),
+          answers: room.bus.phase === "writing" ? null : room.bus.answers,
           rejected: room.bus.rejected,
           duplicates: room.bus.duplicates || {},
           roundScores: room.bus.phase === "results" ? room.bus.roundScores : null,
@@ -474,7 +526,7 @@ function pickWord(room) {
 function startSniperMatch(roomCode) {
   const room = rooms[roomCode];
   if (!room) return;
-  const playerIds = Object.keys(room.players);
+  const playerIds = startablePlayerIds(room);
   if (playerIds.length < 3) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ القناص.");
     return;
@@ -501,7 +553,9 @@ function startSniperMatch(roomCode) {
 
 // لو حد خرج وسط ماتش قناص شغال، أبسط وأسلم حاجة إننا نقفل الماتش ونرجع للوبي
 // بدل ما نحاول نكمل بعدد لاعبين ناقص وسط منطق حساس زي ده.
-function endSniperMatchIfActive(room, roomCode) {
+function endSniperMatchIfActive(room, roomCode, leavingWasOutsideMatch) {
+  // لاعب كان داخل متأخر (أو فاصل وقت البداية) مالوش علاقة بالماتش الشغال - خروجه ما يقفلش الماتش
+  if (leavingWasOutsideMatch) return;
   if (room.selectedGame === "sniper" && room.sniper && room.sniper.phase !== "reveal") {
     room.sniper = null;
     room.started = false;
@@ -620,7 +674,7 @@ function startSpyMatch(roomCode, category) {
       : category;
   const bank = SPY_BANKS[resolvedCategory];
   if (!bank) return;
-  const playerIds = Object.keys(room.players);
+  const playerIds = startablePlayerIds(room);
   if (playerIds.length < 3) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ الجاسوس.");
     return;
@@ -658,7 +712,7 @@ function startBusRound(roomCode, categoryIds, keepTotals) {
   if (!room) return;
   const categories = BUS_CATEGORIES.filter((c) => categoryIds.includes(c.id));
   if (categories.length === 0) return;
-  const playerIds = Object.keys(room.players);
+  const playerIds = startablePlayerIds(room);
   if (playerIds.length < 2) {
     io.to(roomCode).emit("game:error", "لازم لاعبين على الأقل عشان تبدأ أتوبيس كومبليت استوب.");
     return;
@@ -687,22 +741,6 @@ function startBusRound(roomCode, categoryIds, keepTotals) {
 function isValidBusAnswer(value) {
   if (!value || value.length < 2) return false;
   return /[a-zA-Z\u0600-\u06FF]/.test(value); // لازم يحتوي على حرف عربي أو إنجليزي واحد على الأقل
-}
-
-// الإجابات اللى مش كلمة حقيقية (علامة، شطبة، رموز، رقم لوحده) أصلاً بصفر فى الحساب،
-// فمش المفروض تتعرض فى الجدول كمان - بنفضيها قبل ما تتبعت للكلاينت
-function sanitizeBusAnswers(bus) {
-  const out = {};
-  for (const pid of Object.keys(bus.answers || {})) {
-    const row = bus.answers[pid] || {};
-    const clean = {};
-    for (const category of bus.categories) {
-      const raw = (row[category.id] || "").trim();
-      clean[category.id] = isValidBusAnswer(raw.toLowerCase()) ? row[category.id] : "";
-    }
-    out[pid] = clean;
-  }
-  return out;
 }
 
 function computeBusScores(room) {
@@ -792,6 +830,7 @@ function startMoviesRound(roomCode, keepScores) {
     timeout: null,
   };
   room.movies.timeout = setTimeout(() => endMoviesRound(roomCode, "timeout"), duration * 1000 + 300);
+  activateWaitingPlayers(room);
   room.started = true;
   room.phase = "moviesPlaying";
   broadcastRoom(roomCode);
@@ -823,7 +862,7 @@ function endMoviesRound(roomCode, reason) {
 function startSystemMatch(roomCode, customText) {
   const room = rooms[roomCode];
   if (!room) return;
-  const playerIds = Object.keys(room.players);
+  const playerIds = startablePlayerIds(room);
   if (playerIds.length < 3) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ سيستم.");
     return;
@@ -906,7 +945,7 @@ function shuffleArray(arr) {
 function startMafiaMatch(roomCode, mafiaCountChoice) {
   const room = rooms[roomCode];
   if (!room) return;
-  const playerIds = Object.keys(room.players);
+  const playerIds = startablePlayerIds(room);
   const n = playerIds.length;
   if (n < 4) {
     io.to(roomCode).emit("game:error", "لازم 4 لاعبين على الأقل عشان تبدأ مافيا.");
@@ -1057,7 +1096,7 @@ function resolveMafiaVote(roomCode) {
 function startGuessMatch(roomCode, category) {
   const room = rooms[roomCode];
   if (!room) return;
-  const playerIds = Object.keys(room.players);
+  const playerIds = startablePlayerIds(room);
   if (playerIds.length < 3) {
     io.to(roomCode).emit("game:error", "لازم 3 لاعبين على الأقل عشان تبدأ خمن.");
     return;
@@ -1283,8 +1322,6 @@ function advanceToNextBidder(roomCode) {
   const bidValue = room.round.bids[teamId].value;
   const sel = room.round.selections[teamId];
 
-  room.round.pendingWithdrawTeamId = null;
-  room.round.pendingHandoffReason = null;
   room.phase = "explain";
   room.round.explain = {
     teamId,
@@ -1320,19 +1357,6 @@ function onExplainTimeout(roomCode) {
     teamId,
     teamName: room.teams[teamId] ? room.teams[teamId].name : "؟",
   });
-
-  // لو فيه فريق تاني لسه ليه دور، نوقف على شاشة فاصلة الأول بدل ما تايمر
-  // الفريق الجديد يبدأ فى نفس اللحظة اللي خلص فيها وقت اللي قبله.
-  // لو ده كان آخر فريق، التصويت نفسه بيبقى هو الفاصل فمفيش داعي لشاشة زيادة.
-  const hasNextBidder = room.round.bidOrderIndex + 1 < room.round.bidOrder.length;
-  if (hasNextBidder) {
-    room.phase = "explainWithdrawn";
-    room.round.pendingWithdrawTeamId = teamId;
-    room.round.pendingHandoffReason = "timeout";
-    broadcastRoom(roomCode);
-    return;
-  }
-
   advanceToNextBidder(roomCode);
 }
 
@@ -1347,7 +1371,6 @@ function onWithdraw(roomCode, requesterId) {
   // فورًا من غير ما الكل ياخد لحظة يستوعب إن اللي فات انسحب.
   room.phase = "explainWithdrawn";
   room.round.pendingWithdrawTeamId = teamId;
-  room.round.pendingHandoffReason = "withdraw";
   io.to(roomCode).emit("explain:withdrawn", {
     teamId,
     teamName: room.teams[teamId] ? room.teams[teamId].name : "؟",
@@ -1425,8 +1448,21 @@ function checkGameOver(roomCode, next) {
 
 // ---------- Socket handlers ----------
 io.on("connection", (socket) => {
-  socket.on("host:create", ({ name, token }) => {
-    const roomCode = makeRoomCode();
+  socket.on("host:create", ({ name, token, preferredCode }) => {
+    // الكود الثابت: لو الهوست خرج ورجع يعمل غرفة، يحاول ياخد نفس الكود القديم
+    // عشان لينكات الدعوة اللي اتبعتت قبل كده تفضل شغالة
+    const wanted = typeof preferredCode === "string" ? preferredCode.toUpperCase().trim() : "";
+    const validWanted = /^[A-HJ-NP-Z2-9]{4}$/.test(wanted);
+    if (validWanted && rooms[wanted]) {
+      // الغرفة لسه موجودة والهوست بتاعها هو نفسه (فاصل) - يرجع لها بدل غرفة جديدة
+      const existing = rooms[wanted];
+      const oldHostId = existing.hostSocketId;
+      if (token && existing.players[oldHostId] && existing.players[oldHostId].token === token && existing.players[oldHostId].disconnected) {
+        attachSocketToPlayer(socket, wanted, existing, oldHostId);
+        return;
+      }
+    }
+    const roomCode = validWanted && !rooms[wanted] ? wanted : makeRoomCode();
     const room = newRoom(socket.id);
     room.players[socket.id] = {
       name: (name || "Host").trim() || "Host",
@@ -1445,52 +1481,48 @@ io.on("connection", (socket) => {
     roomCode = (roomCode || "").toUpperCase().trim();
     const room = rooms[roomCode];
     if (!room) {
-      socket.emit("game:error", "كود الغرفة غير موجود.");
+      socket.emit("room:joinFailed", { reason: "room_missing" });
+      socket.emit("game:error", "كود الغرفة غير موجود أو الغرفة اتقفلت.");
       return;
     }
-    if (room.started) {
-      socket.emit("game:error", "المباراة بدأت بالفعل، مينفعش تنضم دلوقتي.");
+    // نفس الجهاز كان فى الغرفة دي قبل كده (فتح لينك تاني مثلاً) - يرجع لمكانه
+    // بدل ما يتكرر كلاعب جديد، وحتى لو الماتش شغال
+    const existingId = findPlayerIdByToken(room, token);
+    if (existingId) {
+      attachSocketToPlayer(socket, roomCode, room, existingId);
       return;
     }
+    // لو الماتش شغال، اللاعب بيدخل الغرفة كلاعب "منتظر" ويدخل الماتش الجاي
+    const late = !!room.started;
     room.players[socket.id] = {
       name: (name || "لاعب").trim() || "لاعب",
       teamId: null,
       avatarId: randomInt(AVATAR_COUNT),
       token: token || socket.id,
+      late,
     };
     socket.join(roomCode);
     socket.data.roomCode = roomCode;
-    socket.emit("you:joined", { roomCode, id: socket.id, isHost: false });
+    socket.emit("you:joined", { roomCode, id: socket.id, isHost: false, late });
     broadcastRoom(roomCode);
   });
 
   // لاعب كان متصل، اتقطع (قفل الموبايل، التطبيق راح للخلفية، نت اتقطع)،
-  // ورجع يفتح تاني خلال مدة السماح - بيرجع لنفس مكانه بالظبط
+  // ورجع يفتح تاني - بيرجع لنفس مكانه بالظبط. بيشتغل كمان كـ "مزامنة"
+  // لو السوكيت لسه متصل وبس محتاج يجيب آخر حالة.
   socket.on("player:rejoin", ({ roomCode, token }) => {
     roomCode = (roomCode || "").toUpperCase().trim();
     const room = rooms[roomCode];
     if (!room) {
-      socket.emit("game:error", "الغرفة مش موجودة أو خلصت.");
+      socket.emit("room:joinFailed", { reason: "room_missing", rejoin: true });
       return;
     }
-    const oldId = Object.keys(room.players).find(
-      (id) => room.players[id].disconnected && token && room.players[id].token === token
-    );
+    const oldId = findPlayerIdByToken(room, token);
     if (!oldId) {
-      socket.emit("game:error", "مقدرش ألاقي مكانك فى الغرفة، جرب تدخل من الأول.");
+      socket.emit("room:joinFailed", { reason: "not_in_room", rejoin: true, started: !!room.started });
       return;
     }
-    const player = room.players[oldId];
-    if (player.graceTimeout) clearTimeout(player.graceTimeout);
-    remapPlayerId(room, oldId, socket.id);
-    room.players[socket.id].disconnected = false;
-    room.players[socket.id].graceTimeout = null;
-    socket.join(roomCode);
-    socket.data.roomCode = roomCode;
-    const isHost = room.hostSocketId === socket.id;
-    socket.emit("you:joined", { roomCode, id: socket.id, isHost });
-    resendPrivateStateOnRejoin(room, socket.id);
-    broadcastRoom(roomCode);
+    attachSocketToPlayer(socket, roomCode, room, oldId);
   });
 
   // الهوست بيختار اللعبة اللي الأوضة هتلعبها. دلوقتي بس 'mazad' متاحة فعليًا -
@@ -1596,6 +1628,7 @@ io.on("connection", (socket) => {
       return;
     }
     room.turnOrder = teamsWithPlayers;
+    activateWaitingPlayers(room);
     room.started = true;
     startRound(roomCode);
   });
@@ -1711,16 +1744,11 @@ io.on("connection", (socket) => {
     if (s.eliminatedOrder.includes(socket.id)) return; // دوسها قبل كده
     s.eliminatedOrder.push(socket.id);
 
-    // أول ما يفضل شخص واحد بس معندوش "اتقتلت" (غير القناص لو كسل يدوسها)، هو ده اللي هيخمن.
-    // لازم يبقى الشخص اللي *لسه عايش* - مش اللي لسه دايس اتقتلت دلوقتي.
-    if (!s.guesserId) {
-      const stillAlive = s.playerOrder.filter(
-        (pid) => !s.eliminatedOrder.includes(pid) && room.players[pid]
-      );
-      if (stillAlive.length === 1) {
-        s.guesserId = stillAlive[0];
-        s.phase = "guessing";
-      }
+    // أول ما يفضل شخص واحد بس معندوش "اتقتلت" (غير القناص لو كسل يدوسها)، هو ده اللي هيخمن
+    const totalPlayers = s.playerOrder.length;
+    if (s.eliminatedOrder.length === totalPlayers - 1 && !s.guesserId) {
+      s.guesserId = socket.id;
+      s.phase = "guessing";
     }
     broadcastRoom(roomCode);
   });
@@ -2275,11 +2303,12 @@ io.on("connection", (socket) => {
       return;
     }
     const player = room.players[socket.id];
+    const wasOutside = !!(player && player.late && room.started);
     if (player && player.teamId && room.teams[player.teamId]) {
       handleMidRoundDeparture(roomCode, socket.id);
       room.teams[player.teamId].playerIds = room.teams[player.teamId].playerIds.filter((id) => id !== socket.id);
     }
-    endSniperMatchIfActive(room, roomCode);
+    endSniperMatchIfActive(room, roomCode, wasOutside);
     delete room.players[socket.id];
     socket.leave(roomCode);
     socket.data.roomCode = null;
@@ -2352,11 +2381,12 @@ function finalizePlayerRemoval(roomCode, socketId) {
   if (!room) return;
   const player = room.players[socketId];
   if (!player || !player.disconnected) return; // رجع فعلاً قبل كده، منلمسهوش
+  const wasOutside = !!player.late && !!room.started;
   if (player.teamId && room.teams[player.teamId]) {
     handleMidRoundDeparture(roomCode, socketId);
     room.teams[player.teamId].playerIds = room.teams[player.teamId].playerIds.filter((id) => id !== socketId);
   }
-  endSniperMatchIfActive(room, roomCode);
+  endSniperMatchIfActive(room, roomCode, wasOutside);
   delete room.players[socketId];
   if (socketId === room.hostSocketId) {
     io.to(roomCode).emit("game:ended", { reason: "host_left" });
